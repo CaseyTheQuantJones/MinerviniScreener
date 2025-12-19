@@ -22,7 +22,7 @@ BATCH_SIZE = 15
 SLEEP_BETWEEN_BATCHES = 3
 MAX_RETRIES = 3
 
-RS_LOOKBACK = "18mo"   # needed for 12M ROC
+RS_LOOKBACK = "18mo"
 
 EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
@@ -42,7 +42,7 @@ results = []
 failed_tickers = []
 
 # --------------------------------------------------
-# HELPER FUNCTIONS
+# HELPER
 # --------------------------------------------------
 def rate_of_change(prices, days):
     if len(prices) >= days:
@@ -50,7 +50,7 @@ def rate_of_change(prices, days):
     return np.nan
 
 # --------------------------------------------------
-# MAIN SCREEN — TREND TEMPLATE FIRST
+# TREND TEMPLATE SCREEN (UNCHANGED LOGIC, FIXED GUARDS)
 # --------------------------------------------------
 for i in range(0, len(tickers), BATCH_SIZE):
     batch = tickers[i:i + BATCH_SIZE]
@@ -68,16 +68,22 @@ for i in range(0, len(tickers), BATCH_SIZE):
             break
         except Exception as e:
             wait = random.randint(10, 20)
-            print(f"Retry {attempt+1}/{MAX_RETRIES} — waiting {wait}s")
+            print(f"Retry {attempt+1}/{MAX_RETRIES}, waiting {wait}s")
             time.sleep(wait)
     else:
         for t in batch:
-            failed_tickers.append({"Ticker": t, "Reason": "Trend download failed"})
+            failed_tickers.append({"Ticker": t, "Reason": "Download failed"})
         continue
 
     for ticker in batch:
         try:
-            df = data[ticker] if len(batch) > 1 else data
+            if isinstance(data.columns, pd.MultiIndex):
+                if ticker not in data.columns.get_level_values(0):
+                    continue
+                df = data[ticker]
+            else:
+                df = data
+
             if df.empty or len(df) < MA_LONG:
                 continue
 
@@ -88,31 +94,41 @@ for i in range(0, len(tickers), BATCH_SIZE):
             ma150 = close.rolling(MA_MED).mean()
             ma200 = close.rolling(MA_LONG).mean()
 
+            # ---------------- CRITICAL GUARD (RESTORED) ----------------
+            if (
+                pd.isna(ma50.iloc[-1]) or
+                pd.isna(ma150.iloc[-1]) or
+                pd.isna(ma200.iloc[-1])
+            ):
+                continue
+
             price = close.iloc[-1]
 
-            # ---------------- TREND TEMPLATE ----------------
+            # ---------------- TREND RULES (ORIGINAL STRICTNESS) ----------------
             if not (
                 price > ma150.iloc[-1] > ma200.iloc[-1] and
                 ma50.iloc[-1] > ma150.iloc[-1] > ma200.iloc[-1]
             ):
                 continue
 
-            if (ma200.iloc[-1] - ma200.iloc[-20]) <= 0:
+            if ma200.iloc[-20] >= ma200.iloc[-1]:
                 continue
 
             low_52w = close.min()
             high_52w = close.max()
 
-            if price / low_52w < 1.25 or price / high_52w < 0.75:
+            if price / low_52w < 1.25:
+                continue
+
+            if price / high_52w < 0.75:
                 continue
 
             if volume.tail(50).mean() < MIN_VOLUME:
                 continue
 
-            # ---------------- METADATA ----------------
-            info = yf.Ticker(ticker).fast_info or {}
-            sector = info.get("sector", "Unknown")
-            industry = info.get("industry", "Unknown")
+            # ---------------- METADATA (SAFE) ----------------
+            sector = "Unknown"
+            industry = "Unknown"
 
             results.append({
                 "Ticker": ticker,
@@ -129,29 +145,28 @@ for i in range(0, len(tickers), BATCH_SIZE):
         except Exception as e:
             failed_tickers.append({"Ticker": ticker, "Reason": str(e)})
 
-    print(f"Processed batch {i//BATCH_SIZE + 1}")
+    print(f"Processed batch {i // BATCH_SIZE + 1}")
     time.sleep(SLEEP_BETWEEN_BATCHES)
 
 # --------------------------------------------------
-# RS CALCULATION — ONLY ON SURVIVORS
+# RS CALCULATION — ANNOTATION ONLY
 # --------------------------------------------------
 df = pd.DataFrame(results)
+print(f"Trend survivors: {len(df)}")
 
 if not df.empty:
-    rs_results = []
-
-    rs_tickers = df["Ticker"].tolist()
-
     rs_data = yf.download(
-        rs_tickers,
+        df["Ticker"].tolist(),
         period=RS_LOOKBACK,
         group_by="ticker",
         auto_adjust=False,
-        progress=False,
-        threads=True
+        threads=True,
+        progress=False
     )
 
-    for ticker in rs_tickers:
+    rs_rows = []
+
+    for ticker in df["Ticker"]:
         try:
             if ticker not in rs_data or "Adj Close" not in rs_data[ticker]:
                 continue
@@ -173,7 +188,7 @@ if not df.empty:
                 0.20 * roc_12m
             )
 
-            rs_results.append({
+            rs_rows.append({
                 "Ticker": ticker,
                 "RS_Strength": round(strength, 2)
             })
@@ -181,17 +196,17 @@ if not df.empty:
         except Exception:
             continue
 
-    rs_df = pd.DataFrame(rs_results)
+    rs_df = pd.DataFrame(rs_rows)
 
-    df = df.merge(rs_df, on="Ticker", how="inner")
+    df = df.merge(rs_df, on="Ticker", how="left")
+    df["RS_Rating"] = (df["RS_Strength"].rank(pct=True) * 100).round().astype("Int64")
 
-    df["RS_Rating"] = (df["RS_Strength"].rank(pct=True) * 100).round().astype(int)
-
-    df = df.sort_values("RS_Rating", ascending=False)
+print(f"After RS merge: {len(df)}")
 
 # --------------------------------------------------
 # OUTPUT
 # --------------------------------------------------
+df = df.sort_values("RS_Rating", ascending=False)
 df.to_csv("minervini_candidates.csv", index=False)
 
 if failed_tickers:
@@ -209,17 +224,21 @@ sector_report.to_csv("sector_industry_report.csv", index=False)
 # EMAIL
 # --------------------------------------------------
 if len(df) > 0:
-    body = f"Minervini Screen Results\n\nTotal candidates: {len(df)}\n\n"
-
     msg = EmailMessage()
     msg["Subject"] = "Minervini Screener — Trend + RS"
     msg["From"] = EMAIL_ADDRESS
     msg["To"] = TO_EMAIL
-    msg.set_content(body)
+    msg.set_content(f"Total candidates: {len(df)}")
 
-    for f in ["minervini_candidates.csv", "sector_industry_report.csv"]:
-        with open(f, "rb") as file:
-            msg.add_attachment(file.read(), maintype="application", subtype="csv", filename=f)
+    for file in ["minervini_candidates.csv", "sector_industry_report.csv"]:
+        if os.path.exists(file):
+            with open(file, "rb") as f:
+                msg.add_attachment(
+                    f.read(),
+                    maintype="application",
+                    subtype="csv",
+                    filename=file
+                )
 
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
         smtp.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
@@ -228,4 +247,5 @@ if len(df) > 0:
     print("📧 Email sent")
 else:
     print("⚠️ No candidates found")
+
 
