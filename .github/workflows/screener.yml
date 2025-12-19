@@ -1,0 +1,37 @@
+name: Minervini Screener
+
+on:
+  # Schedule to run at 4:05 PM Eastern Time (ET) Mon-Fri
+  # ET is UTC-5 (UTC-4 during DST). Here we use 21:05 UTC as standard
+  schedule:
+    - cron: '5 21 * * 1-5'  # 21:05 UTC → 4:05 PM ET
+  workflow_dispatch:        # Allows manual triggering
+
+jobs:
+  run_screener:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Check out your repository
+      - uses: actions/checkout@v3
+
+      # Step 2: Set up Python
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      # Step 3: Install dependencies
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Step 4: Run the Minervini screener
+      - name: Run screener
+        env:
+          EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          TO_EMAIL: ${{ secrets.TO_EMAIL }}
+        run: |
+          python screener.py
