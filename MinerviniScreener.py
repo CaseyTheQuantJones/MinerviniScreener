@@ -1,11 +1,12 @@
 import pandas as pd
 import yfinance as yf
+import numpy as np
 import time
 import os
 import smtplib
-from email.message import EmailMessage
 import warnings
 import random
+from email.message import EmailMessage
 
 warnings.filterwarnings("ignore")
 
@@ -17,9 +18,11 @@ MA_SHORT = 50
 MA_MED = 150
 MA_LONG = 200
 
-BATCH_SIZE = 15       # small batch to reduce rate limiting
-SLEEP_BETWEEN_BATCHES = 3  # seconds
+BATCH_SIZE = 15
+SLEEP_BETWEEN_BATCHES = 3
 MAX_RETRIES = 3
+
+RS_LOOKBACK = "18mo"   # needed for 12M ROC
 
 EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
@@ -29,47 +32,53 @@ if not EMAIL_ADDRESS or not EMAIL_PASSWORD or not TO_EMAIL:
     raise ValueError("❌ Email environment variables not set")
 
 # --------------------------------------------------
-# LOAD AND CLEAN TICKERS
+# LOAD TICKERS
 # --------------------------------------------------
 tickers_raw = pd.read_csv("validated_us_tickers.csv", header=None)[0].tolist()
-tickers = [str(t).strip() for t in tickers_raw if isinstance(t, str) and t.strip()]
-invalid_tickers = [t for t in tickers_raw if not isinstance(t, str) or not str(t).strip()]
-
-if invalid_tickers:
-    print(f"Skipping invalid tickers: {invalid_tickers}")
-
+tickers = [str(t).strip().upper() for t in tickers_raw if isinstance(t, str) and t.strip()]
 print(f"Loaded {len(tickers)} valid tickers")
 
 results = []
-failed_tickers = [{"Ticker": t, "Reason": "Invalid ticker"} for t in invalid_tickers]
+failed_tickers = []
 
 # --------------------------------------------------
-# SCREENING LOOP WITH BATCH DOWNLOADS
+# HELPER FUNCTIONS
+# --------------------------------------------------
+def rate_of_change(prices, days):
+    if len(prices) >= days:
+        return (prices.iloc[-1] / prices.iloc[-days] - 1) * 100
+    return np.nan
+
+# --------------------------------------------------
+# MAIN SCREEN — TREND TEMPLATE FIRST
 # --------------------------------------------------
 for i in range(0, len(tickers), BATCH_SIZE):
     batch = tickers[i:i + BATCH_SIZE]
-    retries = 0
-    while retries < MAX_RETRIES:
+
+    for attempt in range(MAX_RETRIES):
         try:
-            data = yf.download(batch, period="1y", auto_adjust=True, group_by='ticker', threads=True)
+            data = yf.download(
+                batch,
+                period="1y",
+                auto_adjust=True,
+                group_by="ticker",
+                threads=True,
+                progress=False
+            )
             break
         except Exception as e:
-            retries += 1
-            wait_time = random.randint(10, 20)
-            print(f"Batch download failed (attempt {retries}/{MAX_RETRIES}): {e}")
-            print(f"Retrying in {wait_time} seconds...")
-            time.sleep(wait_time)
+            wait = random.randint(10, 20)
+            print(f"Retry {attempt+1}/{MAX_RETRIES} — waiting {wait}s")
+            time.sleep(wait)
     else:
-        print(f"Batch {batch} failed after {MAX_RETRIES} retries")
         for t in batch:
-            failed_tickers.append({"Ticker": t, "Reason": "Download failed after retries"})
+            failed_tickers.append({"Ticker": t, "Reason": "Trend download failed"})
         continue
 
     for ticker in batch:
         try:
             df = data[ticker] if len(batch) > 1 else data
             if df.empty or len(df) < MA_LONG:
-                failed_tickers.append({"Ticker": ticker, "Reason": "Not enough data"})
                 continue
 
             close = df["Close"]
@@ -80,48 +89,28 @@ for i in range(0, len(tickers), BATCH_SIZE):
             ma200 = close.rolling(MA_LONG).mean()
 
             price = close.iloc[-1]
-            ma50_now = ma50.iloc[-1]
-            ma150_now = ma150.iloc[-1]
-            ma200_now = ma200.iloc[-1]
 
-            # --------------------------------------------------
-            # TREND RULES
-            # --------------------------------------------------
-            if not (price > ma150_now > ma200_now and ma50_now > ma150_now and ma50_now > ma200_now):
-                failed_tickers.append({"Ticker": ticker, "Reason": "Trend MA rules failed"})
+            # ---------------- TREND TEMPLATE ----------------
+            if not (
+                price > ma150.iloc[-1] > ma200.iloc[-1] and
+                ma50.iloc[-1] > ma150.iloc[-1] > ma200.iloc[-1]
+            ):
                 continue
 
-            ma200_slope = (ma200_now - ma200.iloc[-20]) / 20
-            if ma200_slope <= 0:
-                failed_tickers.append({"Ticker": ticker, "Reason": "MA200 not trending up"})
+            if (ma200.iloc[-1] - ma200.iloc[-20]) <= 0:
                 continue
 
-            # --------------------------------------------------
-            # PRICE VS 52-WEEK HIGH/LOW
-            # --------------------------------------------------
             low_52w = close.min()
             high_52w = close.max()
 
-            if price / low_52w < 1.25:
-                failed_tickers.append({"Ticker": ticker, "Reason": "Price too close to 52-week low"})
+            if price / low_52w < 1.25 or price / high_52w < 0.75:
                 continue
 
-            if price / high_52w < 0.75:
-                failed_tickers.append({"Ticker": ticker, "Reason": "Price too far from 52-week high"})
-                continue
-
-            # --------------------------------------------------
-            # LIQUIDITY
-            # --------------------------------------------------
             if volume.tail(50).mean() < MIN_VOLUME:
-                failed_tickers.append({"Ticker": ticker, "Reason": "Low average volume"})
                 continue
 
-            # --------------------------------------------------
-            # METADATA (lightweight)
-            # --------------------------------------------------
-            tkr = yf.Ticker(ticker)
-            info = getattr(tkr, "fast_info", {})
+            # ---------------- METADATA ----------------
+            info = yf.Ticker(ticker).fast_info or {}
             sector = info.get("sector", "Unknown")
             industry = info.get("industry", "Unknown")
 
@@ -132,22 +121,77 @@ for i in range(0, len(tickers), BATCH_SIZE):
                 "Price": round(price, 2),
                 "% From 52W High": round((1 - price / high_52w) * 100, 1),
                 "% From 52W Low": round((price / low_52w - 1) * 100, 1),
-                "MA50": round(ma50_now, 2),
-                "MA150": round(ma150_now, 2),
-                "MA200": round(ma200_now, 2)
+                "MA50": round(ma50.iloc[-1], 2),
+                "MA150": round(ma150.iloc[-1], 2),
+                "MA200": round(ma200.iloc[-1], 2)
             })
 
         except Exception as e:
-            failed_tickers.append({"Ticker": ticker, "Reason": f"Other error: {e}"})
-            continue
+            failed_tickers.append({"Ticker": ticker, "Reason": str(e)})
 
-    print(f"Processed batch {i // BATCH_SIZE + 1} / {len(tickers) // BATCH_SIZE + 1}")
+    print(f"Processed batch {i//BATCH_SIZE + 1}")
     time.sleep(SLEEP_BETWEEN_BATCHES)
 
 # --------------------------------------------------
-# OUTPUT FILES
+# RS CALCULATION — ONLY ON SURVIVORS
 # --------------------------------------------------
 df = pd.DataFrame(results)
+
+if not df.empty:
+    rs_results = []
+
+    rs_tickers = df["Ticker"].tolist()
+
+    rs_data = yf.download(
+        rs_tickers,
+        period=RS_LOOKBACK,
+        group_by="ticker",
+        auto_adjust=False,
+        progress=False,
+        threads=True
+    )
+
+    for ticker in rs_tickers:
+        try:
+            if ticker not in rs_data or "Adj Close" not in rs_data[ticker]:
+                continue
+
+            prices = rs_data[ticker]["Adj Close"].dropna()
+
+            roc_3m  = rate_of_change(prices, 63)
+            roc_6m  = rate_of_change(prices, 126)
+            roc_9m  = rate_of_change(prices, 189)
+            roc_12m = rate_of_change(prices, 252)
+
+            if np.isnan([roc_3m, roc_6m, roc_9m, roc_12m]).any():
+                continue
+
+            strength = (
+                0.40 * roc_3m +
+                0.20 * roc_6m +
+                0.20 * roc_9m +
+                0.20 * roc_12m
+            )
+
+            rs_results.append({
+                "Ticker": ticker,
+                "RS_Strength": round(strength, 2)
+            })
+
+        except Exception:
+            continue
+
+    rs_df = pd.DataFrame(rs_results)
+
+    df = df.merge(rs_df, on="Ticker", how="inner")
+
+    df["RS_Rating"] = (df["RS_Strength"].rank(pct=True) * 100).round().astype(int)
+
+    df = df.sort_values("RS_Rating", ascending=False)
+
+# --------------------------------------------------
+# OUTPUT
+# --------------------------------------------------
 df.to_csv("minervini_candidates.csv", index=False)
 
 if failed_tickers:
@@ -162,39 +206,26 @@ sector_report = (
 sector_report.to_csv("sector_industry_report.csv", index=False)
 
 # --------------------------------------------------
-# EMAIL RESULTS
+# EMAIL
 # --------------------------------------------------
 if len(df) > 0:
-    body = f"""Minervini First-Pass Screen
-
-Total candidates: {len(df)}
-
-Top Sectors / Industries:
-"""
-    for _, row in sector_report.head(10).iterrows():
-        body += f"{row['Sector']} | {row['Industry']} : {row['Count']}\n"
+    body = f"Minervini Screen Results\n\nTotal candidates: {len(df)}\n\n"
 
     msg = EmailMessage()
-    msg["Subject"] = "Minervini Screener — Trend & Leadership"
+    msg["Subject"] = "Minervini Screener — Trend + RS"
     msg["From"] = EMAIL_ADDRESS
     msg["To"] = TO_EMAIL
     msg.set_content(body)
 
-    for file in ["minervini_candidates.csv", "sector_industry_report.csv", "failed_tickers.csv"]:
-        if os.path.exists(file):
-            with open(file, "rb") as f:
-                msg.add_attachment(
-                    f.read(),
-                    maintype="application",
-                    subtype="csv",
-                    filename=file
-                )
+    for f in ["minervini_candidates.csv", "sector_industry_report.csv"]:
+        with open(f, "rb") as file:
+            msg.add_attachment(file.read(), maintype="application", subtype="csv", filename=f)
 
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
         smtp.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
         smtp.send_message(msg)
 
-    print("📧 Email sent successfully")
+    print("📧 Email sent")
 else:
-    print("⚠️ No candidates found — email not sent")
+    print("⚠️ No candidates found")
 
