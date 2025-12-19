@@ -5,6 +5,7 @@ import os
 import smtplib
 from email.message import EmailMessage
 import warnings
+import random
 
 warnings.filterwarnings("ignore")
 
@@ -15,7 +16,10 @@ MIN_VOLUME = 300_000
 MA_SHORT = 50
 MA_MED = 150
 MA_LONG = 200
-SLEEP = 0.01  # only between batch downloads
+
+BATCH_SIZE = 15       # small batch to reduce rate limiting
+SLEEP_BETWEEN_BATCHES = 3  # seconds
+MAX_RETRIES = 3
 
 EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
@@ -24,25 +28,41 @@ TO_EMAIL = os.getenv("TO_EMAIL")
 if not EMAIL_ADDRESS or not EMAIL_PASSWORD or not TO_EMAIL:
     raise ValueError("❌ Email environment variables not set")
 
-tickers = pd.read_csv("validated_us_tickers.csv", header=None)[0].tolist()
-print(f"Loaded {len(tickers)} tickers")
+# --------------------------------------------------
+# LOAD AND CLEAN TICKERS
+# --------------------------------------------------
+tickers_raw = pd.read_csv("validated_us_tickers.csv", header=None)[0].tolist()
+tickers = [str(t).strip() for t in tickers_raw if isinstance(t, str) and t.strip()]
+invalid_tickers = [t for t in tickers_raw if not isinstance(t, str) or not str(t).strip()]
+
+if invalid_tickers:
+    print(f"Skipping invalid tickers: {invalid_tickers}")
+
+print(f"Loaded {len(tickers)} valid tickers")
 
 results = []
-failed_tickers = []
+failed_tickers = [{"Ticker": t, "Reason": "Invalid ticker"} for t in invalid_tickers]
 
 # --------------------------------------------------
-# BATCH DOWNLOAD
+# SCREENING LOOP WITH BATCH DOWNLOADS
 # --------------------------------------------------
-print("Downloading historical data in batches...")
-batch_size = 50  # adjust if you hit rate limits
-for i in range(0, len(tickers), batch_size):
-    batch = tickers[i:i+batch_size]
-    try:
-        data = yf.download(batch, period="1y", auto_adjust=True, group_by='ticker', threads=True)
-    except Exception as e:
-        print(f"Failed to download batch {batch}: {e}")
+for i in range(0, len(tickers), BATCH_SIZE):
+    batch = tickers[i:i + BATCH_SIZE]
+    retries = 0
+    while retries < MAX_RETRIES:
+        try:
+            data = yf.download(batch, period="1y", auto_adjust=True, group_by='ticker', threads=True)
+            break
+        except Exception as e:
+            retries += 1
+            wait_time = random.randint(10, 20)
+            print(f"Batch download failed (attempt {retries}/{MAX_RETRIES}): {e}")
+            print(f"Retrying in {wait_time} seconds...")
+            time.sleep(wait_time)
+    else:
+        print(f"Batch {batch} failed after {MAX_RETRIES} retries")
         for t in batch:
-            failed_tickers.append({"Ticker": t, "Reason": "Download failed"})
+            failed_tickers.append({"Ticker": t, "Reason": "Download failed after retries"})
         continue
 
     for ticker in batch:
@@ -98,18 +118,20 @@ for i in range(0, len(tickers), batch_size):
                 continue
 
             # --------------------------------------------------
-            # METADATA
+            # METADATA (lightweight)
             # --------------------------------------------------
             tkr = yf.Ticker(ticker)
-            info = tkr.info if isinstance(tkr.info, dict) else {}
+            info = getattr(tkr, "fast_info", {})
+            sector = info.get("sector", "Unknown")
+            industry = info.get("industry", "Unknown")
 
             results.append({
                 "Ticker": ticker,
-                "Sector": info.get("sector", "Unknown"),
-                "Industry": info.get("industry", "Unknown"),
+                "Sector": sector,
+                "Industry": industry,
                 "Price": round(price, 2),
-                "% From 52W High": round((1 - price/high_52w) * 100, 1),
-                "% From 52W Low": round((price/low_52w - 1) * 100, 1),
+                "% From 52W High": round((1 - price / high_52w) * 100, 1),
+                "% From 52W Low": round((price / low_52w - 1) * 100, 1),
                 "MA50": round(ma50_now, 2),
                 "MA150": round(ma150_now, 2),
                 "MA200": round(ma200_now, 2)
@@ -119,7 +141,8 @@ for i in range(0, len(tickers), batch_size):
             failed_tickers.append({"Ticker": ticker, "Reason": f"Other error: {e}"})
             continue
 
-    time.sleep(SLEEP)  # pause between batches
+    print(f"Processed batch {i // BATCH_SIZE + 1} / {len(tickers) // BATCH_SIZE + 1}")
+    time.sleep(SLEEP_BETWEEN_BATCHES)
 
 # --------------------------------------------------
 # OUTPUT FILES
@@ -148,7 +171,6 @@ Total candidates: {len(df)}
 
 Top Sectors / Industries:
 """
-
     for _, row in sector_report.head(10).iterrows():
         body += f"{row['Sector']} | {row['Industry']} : {row['Count']}\n"
 
@@ -173,13 +195,6 @@ Top Sectors / Industries:
         smtp.send_message(msg)
 
     print("📧 Email sent successfully")
-
 else:
     print("⚠️ No candidates found — email not sent")
-
-
-       
-
-
-
 
