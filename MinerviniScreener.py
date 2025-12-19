@@ -16,17 +16,14 @@ MIN_VOLUME = 300_000
 MA_SHORT = 50
 MA_LONG = 200
 HIGH_THRESHOLD = 0.90          # 90% of 52W high
-MAX_EXT_MA50 = 0.20            # max 20% above MA50
 SLEEP = 0.01
 
-# --------------------------------------------------
-# EMAIL CONFIG (FROM SECRETS / ENV VARS)
-# --------------------------------------------------
+# Email (from GitHub Secrets)
 EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 TO_EMAIL = os.getenv("TO_EMAIL")
 
-if not all([EMAIL_ADDRESS, EMAIL_PASSWORD, TO_EMAIL]):
+if not EMAIL_ADDRESS or not EMAIL_PASSWORD or not TO_EMAIL:
     raise ValueError("❌ Email environment variables not set")
 
 # --------------------------------------------------
@@ -64,11 +61,12 @@ for ticker in tqdm(tickers, desc="Screening stocks"):
         if not (price > ma50_now > ma200_now):
             continue
 
+        # MA200 rising
         if ma200.iloc[-1] <= ma200.iloc[-20]:
             continue
 
         # --------------------------------------------------
-        # 2) LEADERSHIP POSITION
+        # 2) LEADERSHIP (52W HIGH PROXIMITY)
         # --------------------------------------------------
         high_52w = close.max()
         pct_from_high = price / high_52w
@@ -77,20 +75,13 @@ for ticker in tqdm(tickers, desc="Screening stocks"):
             continue
 
         # --------------------------------------------------
-        # 3) NOT EXTENDED
-        # --------------------------------------------------
-        pct_above_ma50 = (price - ma50_now) / ma50_now
-        if pct_above_ma50 > MAX_EXT_MA50:
-            continue
-
-        # --------------------------------------------------
-        # 4) LIQUIDITY
+        # 3) LIQUIDITY
         # --------------------------------------------------
         if volume.tail(50).mean() < MIN_VOLUME:
             continue
 
         # --------------------------------------------------
-        # 5) METADATA
+        # 4) METADATA
         # --------------------------------------------------
         info = tkr.info if isinstance(tkr.info, dict) else {}
 
@@ -100,7 +91,6 @@ for ticker in tqdm(tickers, desc="Screening stocks"):
             "Industry": info.get("industry", "Unknown"),
             "Price": round(price, 2),
             "% From 52W High": round((1 - pct_from_high) * 100, 1),
-            "% Above MA50": round(pct_above_ma50 * 100, 1),
             "MA50": round(ma50_now, 2),
             "MA200": round(ma200_now, 2)
         })
@@ -116,8 +106,6 @@ for ticker in tqdm(tickers, desc="Screening stocks"):
 df = pd.DataFrame(results)
 
 candidates_file = "minervini_candidates.csv"
-sector_file = "sector_industry_report.csv"
-
 df.to_csv(candidates_file, index=False)
 
 sector_report = (
@@ -127,52 +115,51 @@ sector_report = (
       .sort_values("Count", ascending=False)
 )
 
+sector_file = "sector_industry_report.csv"
 sector_report.to_csv(sector_file, index=False)
 
 print("\n✅ Screening complete")
 print(f"Candidates found: {len(df)}")
-print(f"Saved: {candidates_file}")
-print(f"Saved: {sector_file}")
 
 # --------------------------------------------------
 # EMAIL RESULTS
 # --------------------------------------------------
-if len(df) == 0:
-    print("⚠️ No candidates found — email not sent")
-    exit()
-
-# Email body
-body = f"""Minervini First-Pass Screen
+if len(df) > 0:
+    body = f"""Minervini First-Pass Screen
 
 Total candidates: {len(df)}
 
 Top Sectors / Industries:
 """
 
-for _, row in sector_report.head(10).iterrows():
-    body += f"{row['Sector']} | {row['Industry']} : {row['Count']}\n"
+    for _, row in sector_report.head(10).iterrows():
+        body += f"{row['Sector']} | {row['Industry']} : {row['Count']}\n"
 
-msg = EmailMessage()
-msg["Subject"] = "Minervini Screener — Leadership & Candidates"
-msg["From"] = EMAIL_ADDRESS
-msg["To"] = TO_EMAIL
-msg.set_content(body)
+    msg = EmailMessage()
+    msg["Subject"] = "Minervini Screener — Trend & Leadership"
+    msg["From"] = EMAIL_ADDRESS
+    msg["To"] = TO_EMAIL
+    msg.set_content(body)
 
-# Attach CSVs
-for file in [candidates_file, sector_file]:
-    with open(file, "rb") as f:
-        msg.add_attachment(
-            f.read(),
-            maintype="application",
-            subtype="octet-stream",
-            filename=file
-        )
+    for file in [candidates_file, sector_file]:
+        with open(file, "rb") as f:
+            msg.add_attachment(
+                f.read(),
+                maintype="application",
+                subtype="csv",
+                filename=file
+            )
 
-# Send email
-with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-    smtp.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-    smtp.send_message(msg)
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+        smtp.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+        smtp.send_message(msg)
 
-print("📧 Email sent successfully")
+    print("📧 Email sent successfully")
 
+else:
+    print("⚠️ No candidates found — email not sent")
+
+        
+      
+   
 
