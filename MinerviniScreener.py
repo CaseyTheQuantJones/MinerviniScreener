@@ -19,9 +19,15 @@ HIGH_THRESHOLD = 0.90          # 90% of 52W high
 MAX_EXT_MA50 = 0.20            # max 20% above MA50
 SLEEP = 0.01
 
-EMAIL_ADDRESS = "caseythequantjones@gmail.com"
-EMAIL_PASSWORD = "qagn cokv vful pwic"
-TO_EMAIL = "caseythequantjones@gmail.com"
+# --------------------------------------------------
+# EMAIL CONFIG (FROM SECRETS / ENV VARS)
+# --------------------------------------------------
+EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+TO_EMAIL = os.getenv("TO_EMAIL")
+
+if not all([EMAIL_ADDRESS, EMAIL_PASSWORD, TO_EMAIL]):
+    raise ValueError("❌ Email environment variables not set")
 
 # --------------------------------------------------
 # LOAD TICKERS
@@ -39,7 +45,6 @@ for ticker in tqdm(tickers, desc="Screening stocks"):
         tkr = yf.Ticker(ticker)
         data = tkr.history(period="1y", auto_adjust=True)
 
-        # --- Basic data sanity ---
         if data.empty or len(data) < MA_LONG:
             continue
 
@@ -59,7 +64,6 @@ for ticker in tqdm(tickers, desc="Screening stocks"):
         if not (price > ma50_now > ma200_now):
             continue
 
-        # MA200 must be rising (long-term trend)
         if ma200.iloc[-1] <= ma200.iloc[-20]:
             continue
 
@@ -86,7 +90,7 @@ for ticker in tqdm(tickers, desc="Screening stocks"):
             continue
 
         # --------------------------------------------------
-        # 5) COLLECT METADATA (SAFE)
+        # 5) METADATA
         # --------------------------------------------------
         info = tkr.info if isinstance(tkr.info, dict) else {}
 
@@ -112,6 +116,8 @@ for ticker in tqdm(tickers, desc="Screening stocks"):
 df = pd.DataFrame(results)
 
 candidates_file = "minervini_candidates.csv"
+sector_file = "sector_industry_report.csv"
+
 df.to_csv(candidates_file, index=False)
 
 sector_report = (
@@ -121,10 +127,9 @@ sector_report = (
       .sort_values("Count", ascending=False)
 )
 
-sector_file = "sector_industry_report.csv"
 sector_report.to_csv(sector_file, index=False)
 
-print(f"\n✅ Screening complete")
+print("\n✅ Screening complete")
 print(f"Candidates found: {len(df)}")
 print(f"Saved: {candidates_file}")
 print(f"Saved: {sector_file}")
@@ -132,38 +137,42 @@ print(f"Saved: {sector_file}")
 # --------------------------------------------------
 # EMAIL RESULTS
 # --------------------------------------------------
-if len(df) > 0:
-    body = f"""
-Minervini First-Pass Screen
+if len(df) == 0:
+    print("⚠️ No candidates found — email not sent")
+    exit()
+
+# Email body
+body = f"""Minervini First-Pass Screen
 
 Total candidates: {len(df)}
 
 Top Sectors / Industries:
 """
 
-    for _, row in sector_report.head(10).iterrows():
-        body += f"{row['Sector']} | {row['Industry']} : {row['Count']}\n"
+for _, row in sector_report.head(10).iterrows():
+    body += f"{row['Sector']} | {row['Industry']} : {row['Count']}\n"
 
-    msg = EmailMessage()
-    msg["Subject"] = "Minervini Screener — Leadership & Candidates"
-    msg["From"] = EMAIL_ADDRESS
-    msg["To"] = TO_EMAIL
-    msg.set_content(body)
+msg = EmailMessage()
+msg["Subject"] = "Minervini Screener — Leadership & Candidates"
+msg["From"] = EMAIL_ADDRESS
+msg["To"] = TO_EMAIL
+msg.set_content(body)
 
-    for file in [candidates_file, sector_file]:
-        with open(file, "rb") as f:
-            msg.add_attachment(
-                f.read(),
-                maintype="application",
-                subtype="csv",
-                filename=file
-            )
+# Attach CSVs
+for file in [candidates_file, sector_file]:
+    with open(file, "rb") as f:
+        msg.add_attachment(
+            f.read(),
+            maintype="application",
+            subtype="octet-stream",
+            filename=file
+        )
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-        smtp.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-        smtp.send_message(msg)
+# Send email
+with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+    smtp.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+    smtp.send_message(msg)
 
-    print("📧 Email sent successfully")
+print("📧 Email sent successfully")
 
-else:
-    print("⚠️ No candidates found — email not sent")
+
