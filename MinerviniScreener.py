@@ -1,48 +1,15 @@
-import pandas as pd
-import yfinance as yf
-import time
-import os
-import smtplib
-from email.message import EmailMessage
-import warnings
-from tqdm import tqdm
-
-# --------------------------------------------------
-# CONFIG
-# --------------------------------------------------
-warnings.filterwarnings("ignore")
-
-MIN_VOLUME = 300_000
-MA_SHORT = 50
-MA_LONG = 200
-HIGH_THRESHOLD = 0.90          # 90% of 52W high
-SLEEP = 0.01
-
-# Email (from GitHub Secrets)
-EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
-TO_EMAIL = os.getenv("TO_EMAIL")
-
-if not EMAIL_ADDRESS or not EMAIL_PASSWORD or not TO_EMAIL:
-    raise ValueError("❌ Email environment variables not set")
-
-# --------------------------------------------------
-# LOAD TICKERS
-# --------------------------------------------------
-tickers = pd.read_csv("validated_us_tickers.csv", header=None)[0].tolist()
-print(f"Loaded {len(tickers)} tickers")
-
-results = []
-
 # --------------------------------------------------
 # MAIN LOOP
 # --------------------------------------------------
+failed_tickers = []
+
 for ticker in tqdm(tickers, desc="Screening stocks"):
     try:
         tkr = yf.Ticker(ticker)
         data = tkr.history(period="1y", auto_adjust=True)
 
         if data.empty or len(data) < MA_LONG:
+            failed_tickers.append(ticker)
             continue
 
         close = data["Close"]
@@ -59,10 +26,13 @@ for ticker in tqdm(tickers, desc="Screening stocks"):
         # 1) TREND ALIGNMENT
         # --------------------------------------------------
         if not (price > ma50_now > ma200_now):
+            failed_tickers.append(ticker)
             continue
 
-        # MA200 rising
-        if ma200.iloc[-1] <= ma200.iloc[-20]:
+        # MA200 gentle uptrend over last 50 trading days
+        ma200_slope = (ma200_now - ma200.iloc[-50]) / 50
+        if ma200_slope <= 0:
+            failed_tickers.append(ticker)
             continue
 
         # --------------------------------------------------
@@ -71,13 +41,15 @@ for ticker in tqdm(tickers, desc="Screening stocks"):
         high_52w = close.max()
         pct_from_high = price / high_52w
 
-        if pct_from_high < HIGH_THRESHOLD:
+        if pct_from_high < 0.85:  # relaxed from 90%
+            failed_tickers.append(ticker)
             continue
 
         # --------------------------------------------------
         # 3) LIQUIDITY
         # --------------------------------------------------
         if volume.tail(50).mean() < MIN_VOLUME:
+            failed_tickers.append(ticker)
             continue
 
         # --------------------------------------------------
@@ -96,70 +68,11 @@ for ticker in tqdm(tickers, desc="Screening stocks"):
         })
 
     except Exception:
+        failed_tickers.append(ticker)
         continue
 
     time.sleep(SLEEP)
 
-# --------------------------------------------------
-# OUTPUT FILES
-# --------------------------------------------------
-df = pd.DataFrame(results)
-
-candidates_file = "minervini_candidates.csv"
-df.to_csv(candidates_file, index=False)
-
-sector_report = (
-    df.groupby(["Sector", "Industry"], dropna=False)
-      .size()
-      .reset_index(name="Count")
-      .sort_values("Count", ascending=False)
-)
-
-sector_file = "sector_industry_report.csv"
-sector_report.to_csv(sector_file, index=False)
-
-print("\n✅ Screening complete")
-print(f"Candidates found: {len(df)}")
-
-# --------------------------------------------------
-# EMAIL RESULTS
-# --------------------------------------------------
-if len(df) > 0:
-    body = f"""Minervini First-Pass Screen
-
-Total candidates: {len(df)}
-
-Top Sectors / Industries:
-"""
-
-    for _, row in sector_report.head(10).iterrows():
-        body += f"{row['Sector']} | {row['Industry']} : {row['Count']}\n"
-
-    msg = EmailMessage()
-    msg["Subject"] = "Minervini Screener — Trend & Leadership"
-    msg["From"] = EMAIL_ADDRESS
-    msg["To"] = TO_EMAIL
-    msg.set_content(body)
-
-    for file in [candidates_file, sector_file]:
-        with open(file, "rb") as f:
-            msg.add_attachment(
-                f.read(),
-                maintype="application",
-                subtype="csv",
-                filename=file
-            )
-
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-        smtp.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-        smtp.send_message(msg)
-
-    print("📧 Email sent successfully")
-
-else:
-    print("⚠️ No candidates found — email not sent")
-
-        
-      
-   
-
+# Save failed tickers
+if failed_tickers:
+    pd.DataFrame(failed_tickers, columns=["Ticker"]).to_csv("failed_tickers.csv", index=False)
