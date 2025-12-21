@@ -1,41 +1,40 @@
 import pandas as pd
 import yfinance as yf
+import numpy as np
 import time
 import os
 import smtplib
 from email.message import EmailMessage
-import warnings
 from tqdm import tqdm
+import warnings
 
-# --------------------------------------------------
-# CONFIG
-# --------------------------------------------------
 warnings.filterwarnings("ignore")
 
+# ==================================================
+# CONFIG (UNCHANGED CRITERIA)
+# ==================================================
 MIN_VOLUME = 300_000
 MA_SHORT = 50
 MA_LONG = 200
-HIGH_THRESHOLD = 0.90          # 90% of 52W high
-MAX_EXT_MA50 = 0.20            # max 20% above MA50
-SLEEP = 0.01
+HIGH_THRESHOLD = 0.90
+MAX_EXT_MA50 = 0.20
 
-# Email credentials pulled from GitHub Secrets
+RS_BATCH = 50
+RS_SLEEP = 5
+EPS_SLEEP = 0.5
+
+# Email (GitHub Secrets)
 EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 TO_EMAIL = os.getenv("TO_EMAIL")
 
-# --------------------------------------------------
-# LOAD TICKERS
-# --------------------------------------------------
+# ==================================================
+# STEP 1 — MINERVINI TREND TEMPLATE
+# ==================================================
 tickers = pd.read_csv("validated_us_tickers.csv", header=None)[0].tolist()
-print(f"Loaded {len(tickers)} tickers")
-
 results = []
 
-# --------------------------------------------------
-# MAIN LOOP
-# --------------------------------------------------
-for ticker in tqdm(tickers, desc="Screening stocks"):
+for ticker in tqdm(tickers, desc="Minervini Trend Screen"):
     try:
         tkr = yf.Ticker(ticker)
         data = tkr.history(period="1y", auto_adjust=True)
@@ -50,32 +49,25 @@ for ticker in tqdm(tickers, desc="Screening stocks"):
         ma200 = close.rolling(MA_LONG).mean()
 
         price = close.iloc[-1]
-        ma50_now = ma50.iloc[-1]
-        ma200_now = ma200.iloc[-1]
 
-        # 1) TREND ALIGNMENT
-        if not (price > ma50_now > ma200_now):
+        if not (price > ma50.iloc[-1] > ma200.iloc[-1]):
             continue
 
         if ma200.iloc[-1] <= ma200.iloc[-20]:
             continue
 
-        # 2) LEADERSHIP POSITION
         high_52w = close.max()
         pct_from_high = price / high_52w
         if pct_from_high < HIGH_THRESHOLD:
             continue
 
-        # 3) NOT EXTENDED
-        pct_above_ma50 = (price - ma50_now) / ma50_now
+        pct_above_ma50 = (price - ma50.iloc[-1]) / ma50.iloc[-1]
         if pct_above_ma50 > MAX_EXT_MA50:
             continue
 
-        # 4) LIQUIDITY
         if volume.tail(50).mean() < MIN_VOLUME:
             continue
 
-        # 5) METADATA
         info = tkr.info if isinstance(tkr.info, dict) else {}
 
         results.append({
@@ -85,76 +77,137 @@ for ticker in tqdm(tickers, desc="Screening stocks"):
             "Price": round(price, 2),
             "% From 52W High": round((1 - pct_from_high) * 100, 1),
             "% Above MA50": round(pct_above_ma50 * 100, 1),
-            "MA50": round(ma50_now, 2),
-            "MA200": round(ma200_now, 2)
+            "MA50": round(ma50.iloc[-1], 2),
+            "MA200": round(ma200.iloc[-1], 2)
         })
 
     except Exception:
         continue
 
-    time.sleep(SLEEP)
+df_trend = pd.DataFrame(results)
+df_trend.to_csv("minervini_candidates.csv", index=False)
 
-# --------------------------------------------------
-# OUTPUT FILES
-# --------------------------------------------------
-df = pd.DataFrame(results)
+# ==================================================
+# STEP 2 — RELATIVE STRENGTH
+# ==================================================
+def roc(prices, days):
+    return (prices.iloc[-1] / prices.iloc[-days] - 1) * 100
 
-candidates_file = "minervini_candidates.csv"
-df.to_csv(candidates_file, index=False)
+rs_results = []
+tickers = df_trend["Ticker"].tolist()
 
-sector_report = (
-    df.groupby(["Sector", "Industry"], dropna=False)
-      .size()
-      .reset_index(name="Count")
-      .sort_values("Count", ascending=False)
-)
-
-sector_file = "sector_industry_report.csv"
-sector_report.to_csv(sector_file, index=False)
-
-print(f"\n✅ Screening complete")
-print(f"Candidates found: {len(df)}")
-print(f"Saved: {candidates_file}")
-print(f"Saved: {sector_file}")
-
-# --------------------------------------------------
-# EMAIL RESULTS (GITHUB ACTIONS SAFE)
-# --------------------------------------------------
-if len(df) > 0 and EMAIL_ADDRESS and EMAIL_PASSWORD and TO_EMAIL:
-    body = f"""Minervini First-Pass Screen
-
-Total candidates: {len(df)}
-
-Top Sectors / Industries:
-"""
-
-    for _, row in sector_report.head(10).iterrows():
-        body += f"{row['Sector']} | {row['Industry']} : {row['Count']}\n"
-
-    msg = EmailMessage()
-    msg["Subject"] = "Minervini Screener — Leadership & Candidates"
-    msg["From"] = EMAIL_ADDRESS
-    msg["To"] = TO_EMAIL
-    msg.set_content(body)
-
-    for file in [candidates_file, sector_file]:
-        with open(file, "rb") as f:
-            msg.add_attachment(
-                f.read(),
-                maintype="text",
-                subtype="csv",
-                filename=file
-            )
+for i in tqdm(range(0, len(tickers), RS_BATCH), desc="RS Screen"):
+    batch = tickers[i:i + RS_BATCH]
 
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-            smtp.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-            smtp.send_message(msg)
-        print("📧 Email sent successfully")
+        data = yf.download(
+            batch,
+            period="18mo",
+            group_by="ticker",
+            auto_adjust=False,
+            progress=False,
+            threads=True
+        )
+    except Exception:
+        continue
 
-    except Exception as e:
-        print(f"⚠️ Email failed: {e}")
+    for ticker in batch:
+        try:
+            prices = data[ticker]["Adj Close"].dropna()
 
-else:
-    print("⚠️ Email skipped (no results or missing credentials)")
+            r3  = roc(prices, 63)
+            r6  = roc(prices, 126)
+            r9  = roc(prices, 189)
+            r12 = roc(prices, 252)
 
+            strength = (
+                0.40 * r3 +
+                0.20 * r6 +
+                0.20 * r9 +
+                0.20 * r12
+            )
+
+            rs_results.append({
+                "Ticker": ticker,
+                "RS_3M": round(r3, 2),
+                "RS_6M": round(r6, 2),
+                "RS_9M": round(r9, 2),
+                "RS_12M": round(r12, 2),
+                "Strength": round(strength, 2)
+            })
+
+        except Exception:
+            continue
+
+    time.sleep(RS_SLEEP)
+
+df_rs = pd.DataFrame(rs_results)
+df_rs["RS_Rating"] = (df_rs["Strength"].rank(pct=True) * 100).round().astype(int)
+
+# ==================================================
+# STEP 3 — EPS & SALES GROWTH
+# ==================================================
+df_final = df_trend.merge(df_rs, on="Ticker", how="inner")
+
+df_final["EPS_Growth_YoY_%"] = None
+df_final["Revenue_Growth_YoY_%"] = None
+
+for i, row in tqdm(df_final.iterrows(), total=len(df_final), desc="EPS & Sales"):
+    try:
+        info = yf.Ticker(row["Ticker"]).info
+        if info.get("earningsQuarterlyGrowth") is not None:
+            df_final.at[i, "EPS_Growth_YoY_%"] = round(info["earningsQuarterlyGrowth"] * 100, 1)
+        if info.get("revenueGrowth") is not None:
+            df_final.at[i, "Revenue_Growth_YoY_%"] = round(info["revenueGrowth"] * 100, 1)
+    except Exception:
+        continue
+
+    time.sleep(EPS_SLEEP)
+
+# ==================================================
+# OUTPUT FILES
+# ==================================================
+df_final.sort_values("RS_Rating", ascending=False, inplace=True)
+df_final.to_csv("final_stock_results.csv", index=False)
+
+sector_report = (
+    df_final.groupby(["Sector", "Industry"])
+    .size()
+    .reset_index(name="Count")
+    .sort_values("Count", ascending=False)
+)
+
+sector_report.to_csv("final_sector_industry_report.csv", index=False)
+
+# ==================================================
+# EMAIL RESULTS
+# ==================================================
+msg = EmailMessage()
+msg["Subject"] = "Combined Minervini Screener Results"
+msg["From"] = EMAIL_ADDRESS
+msg["To"] = TO_EMAIL
+
+msg.set_content(f"""
+Combined Screener Complete
+
+Total stocks: {len(df_final)}
+
+Attached:
+- final_stock_results.csv
+- final_sector_industry_report.csv
+""")
+
+for file in ["final_stock_results.csv", "final_sector_industry_report.csv"]:
+    with open(file, "rb") as f:
+        msg.add_attachment(
+            f.read(),
+            maintype="application",
+            subtype="csv",
+            filename=file
+        )
+
+with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+    smtp.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+    smtp.send_message(msg)
+
+print("✅ Combined screener complete — email sent")
