@@ -11,7 +11,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # ==================================================
-# CONFIG (UNCHANGED CRITERIA)
+# CONFIG (UNCHANGED)
 # ==================================================
 MIN_VOLUME = 300_000
 MA_SHORT = 50
@@ -21,9 +21,8 @@ MAX_EXT_MA50 = 0.20
 
 RS_BATCH = 50
 RS_SLEEP = 5
-EPS_SLEEP = 0.5
+EPS_SLEEP = 1.0  # IMPORTANT FIX
 
-# Email (GitHub Secrets)
 EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 TO_EMAIL = os.getenv("TO_EMAIL")
@@ -88,7 +87,7 @@ df_trend = pd.DataFrame(results)
 df_trend.to_csv("minervini_candidates.csv", index=False)
 
 # ==================================================
-# STEP 2 — RELATIVE STRENGTH
+# STEP 2 — RELATIVE STRENGTH (UNCHANGED)
 # ==================================================
 def roc(prices, days):
     return (prices.iloc[-1] / prices.iloc[-days] - 1) * 100
@@ -113,6 +112,9 @@ for i in tqdm(range(0, len(tickers), RS_BATCH), desc="RS Screen"):
 
     for ticker in batch:
         try:
+            if ticker not in data:
+                continue
+
             prices = data[ticker]["Adj Close"].dropna()
 
             r3  = roc(prices, 63)
@@ -145,7 +147,7 @@ df_rs = pd.DataFrame(rs_results)
 df_rs["RS_Rating"] = (df_rs["Strength"].rank(pct=True) * 100).round().astype(int)
 
 # ==================================================
-# STEP 3 — EPS & SALES GROWTH
+# STEP 3 — EPS & SALES (MINIMAL FIX)
 # ==================================================
 df_final = df_trend.merge(df_rs, on="Ticker", how="inner")
 
@@ -153,16 +155,25 @@ df_final["EPS_Growth_YoY_%"] = None
 df_final["Revenue_Growth_YoY_%"] = None
 
 for i, row in tqdm(df_final.iterrows(), total=len(df_final), desc="EPS & Sales"):
+    ticker = row["Ticker"]
+
     try:
-        info = yf.Ticker(row["Ticker"]).info
-        if info.get("earningsQuarterlyGrowth") is not None:
-            df_final.at[i, "EPS_Growth_YoY_%"] = round(info["earningsQuarterlyGrowth"] * 100, 1)
-        if info.get("revenueGrowth") is not None:
-            df_final.at[i, "Revenue_Growth_YoY_%"] = round(info["revenueGrowth"] * 100, 1)
+        # FORCE FRESH OBJECT + DELAY
+        time.sleep(EPS_SLEEP)
+        tkr = yf.Ticker(str(ticker))
+        info = tkr.info if isinstance(tkr.info, dict) else {}
+
+        eps_growth = info.get("earningsQuarterlyGrowth")
+        revenue_growth = info.get("revenueGrowth")
+
+        if eps_growth is not None:
+            df_final.at[i, "EPS_Growth_YoY_%"] = round(eps_growth * 100, 1)
+
+        if revenue_growth is not None:
+            df_final.at[i, "Revenue_Growth_YoY_%"] = round(revenue_growth * 100, 1)
+
     except Exception:
         continue
-
-    time.sleep(EPS_SLEEP)
 
 # ==================================================
 # OUTPUT FILES
@@ -171,7 +182,7 @@ df_final.sort_values("RS_Rating", ascending=False, inplace=True)
 df_final.to_csv("final_stock_results.csv", index=False)
 
 sector_report = (
-    df_final.groupby(["Sector", "Industry"])
+    df_final.groupby(["Sector", "Industry"], dropna=False)
     .size()
     .reset_index(name="Count")
     .sort_values("Count", ascending=False)
@@ -211,3 +222,4 @@ with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
     smtp.send_message(msg)
 
 print("✅ Combined screener complete — email sent")
+
